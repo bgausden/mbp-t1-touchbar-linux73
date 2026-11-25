@@ -12,6 +12,29 @@ or machine-specific NVRAM are included.
   iBridge stays powered, so HID takes the ordinary resume path and the driver
   stays internally suspended. The patch routes ordinary resume through the
   existing restore function. This fix is needed on all supported kernels.
+- **`apple-t1-touchbar-descriptor-pm.patch`** — three bugs in the upstream
+  fork, all visible around suspend/resume:
+  1. The iBridge display-control interface's report descriptor contains two
+     64-bit fields (page 0xff12, usage 0x51). HID 1.11 §8.4 forbids fields
+     wider than 4 bytes, so the kernel logs
+     `hid_field_extract() called with n (64) > 32!` whenever the T1 sends a
+     report containing one — typically right after resume. The fork's rewrite
+     dropped the original driver's `report_fixup()`; this patch restores it
+     (splitting the fields into two 32-bit values), with the return type
+     adapted per kernel because `struct hid_driver.report_fixup` became
+     const-qualified in 6.12.
+  2. `appleib_forward_int_op()` contained a stray unconditional `break;`, so
+     PM callbacks reached only the first virtual sub-device. The
+     ambient-light sensor's `reset_resume()` never ran, leaving the ALS
+     unconfigured after every resume (GNOME ambient brightness via
+     `iio-sensor-proxy` stops following light changes until reboot).
+  3. `appletb_reset_resume()` decided when to restore state from per-interface
+     flags that never get set when the iBridge is already runtime-suspended at
+     system suspend (the common case once the Touch Bar is idle) — the restore
+     then ran once per resume callback, logging `Touchbar resumed.` twice. The
+     patch replaces the flags with a two-interface resume mask that restores
+     exactly once per resume wave regardless of callback order.
+  It also fixes an out-of-bounds read in `appleib_add_device()`'s error unwind.
 - **`apple-t1-touchbar-linux73.patch`** — Linux 7.3 removed `struct acpi_driver`
   in commit `541b293ab186` ("ACPI: bus: Eliminate struct acpi_driver"), so the
   upstream driver no longer compiles. The patch registers a `platform_driver`
@@ -45,8 +68,8 @@ The installer:
    headers;
 2. refuses to continue if the T1 is in recovery mode (`05ac:1281`) — boot macOS
    to the desktop and shut down cleanly first;
-3. clones upstream at the pinned commit, applies the s2idle patch, and the
-   `platform_driver` patch when `uname -r` is 7.3 or newer;
+3. clones upstream at the pinned commit, applies the s2idle and descriptor/PM
+   patches, and the `platform_driver` patch when `uname -r` is 7.3 or newer;
 4. removes any previous DKMS instance, builds and installs for the running
    kernel, and records the provenance in `/usr/src/apple-t1-touchbar-0.1/.source`;
 5. blacklists the generic HID sensor drivers, loads `apple-ib-tb`/`apple-ib-als`
@@ -63,10 +86,11 @@ sudo ./verify.sh
 ```
 
 Expected: the three modules are loaded, DKMS reports the module installed for
-your running kernel, `APP7777:00` is bound to `apple-ibridge` (7.3+), and the
-real iBridge HID interfaces are bound to `apple-ibridge-hid`. `Touchbar resumed`
-appears in the kernel log after a suspend/resume cycle; before the first
-suspend, its absence is normal.
+your running kernel, `APP7777:00` is bound to `apple-ibridge` (7.3+), the real
+iBridge HID interfaces are bound to `apple-ibridge-hid`, and the live iBridge
+report descriptors contain no 64-bit fields (proves the descriptor fixup ran).
+`Touchbar resumed` appears in the kernel log after a suspend/resume cycle;
+before the first suspend, its absence is normal.
 
 ## Wi-Fi on Linux 7.3
 

@@ -18,6 +18,7 @@ die() {
 [[ $EUID -eq 0 ]] || die 'run with sudo'
 [[ -f $HERE/patches/apple-t1-touchbar-s2idle-resume.patch ]] || die 'patches directory is missing'
 [[ -f $HERE/patches/apple-t1-touchbar-linux73.patch ]] || die 'patches directory is missing'
+[[ -f $HERE/patches/apple-t1-touchbar-descriptor-pm.patch ]] || die 'patches directory is missing'
 [[ -f $HERE/dkms.conf ]] || die 'dkms.conf is missing'
 
 kernel_release=$(uname -r)
@@ -45,6 +46,7 @@ trap 'rm -rf "$work"' EXIT
 git clone "$UPSTREAM" "$work/driver"
 git -C "$work/driver" checkout --detach "$COMMIT"
 patch -d "$work/driver" -p1 < "$HERE/patches/apple-t1-touchbar-s2idle-resume.patch"
+patch -d "$work/driver" -p1 < "$HERE/patches/apple-t1-touchbar-descriptor-pm.patch"
 if $need_linux73; then
 	echo 'Applying Linux 7.3+ platform-driver patch'
 	patch -d "$work/driver" -p1 < "$HERE/patches/apple-t1-touchbar-linux73.patch"
@@ -63,6 +65,7 @@ cat > "$SRC/.source" <<EOF
 upstream=$UPSTREAM
 commit=$COMMIT
 patch=apple-t1-touchbar-s2idle-resume.patch
+patch=apple-t1-touchbar-descriptor-pm.patch
 EOF
 if $need_linux73; then
 	echo 'patch=apple-t1-touchbar-linux73.patch' >> "$SRC/.source"

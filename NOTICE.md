@@ -16,6 +16,12 @@ the upstream driver at build time.
 - `patches/apple-t1-touchbar-s2idle-resume.patch` implements the ordinary-resume
   approach described by michaelahess in
   https://github.com/michaelahess/macbook-pro-t1-touchbar-linux (MIT).
+- `patches/apple-t1-touchbar-descriptor-pm.patch` restores the `report_fixup`
+  function from the original GPL-2.0 driver by Ronald Tschalär
+  (roadrunner2/macbook12-spi-driver, `touchbar-driver-hid-driver` branch,
+  reworked into this fork's structure with a kernel-version-conditional return
+  type), and fixes the PM-callback forwarding and resume-restore state machine
+  in this fork's code.
 - `patches/apple-t1-touchbar-linux73.patch` ports the upstream iBridge driver
   from the removed `struct acpi_driver` API to `platform_driver`.
 
