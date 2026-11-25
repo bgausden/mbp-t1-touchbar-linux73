@@ -52,6 +52,38 @@ else
 	fail 's2idle ordinary-resume patch is missing'
 fi
 
+if grep -q 'static .*__u8 \*appleib_report_fixup' "$src/apple-ibridge.c" 2>/dev/null; then
+	pass '64-bit descriptor report_fixup is present'
+else
+	fail 'descriptor report_fixup is missing'
+fi
+
+if grep -q 'APPLETB_RESUMED_BOTH' "$src/apple-ib-tb.c" 2>/dev/null; then
+	pass 'resume rendezvous (single restore per resume wave) is present'
+else
+	fail 'resume rendezvous is missing'
+fi
+
+desc_seen=0
+desc_bad=0
+for f in /sys/kernel/debug/hid/0003:05AC:8600.*/rdesc; do
+	[[ -r $f ]] || continue
+	desc_seen=$((desc_seen + 1))
+	if head -n1 "$f" | grep -q '75 40 95 01'; then
+		desc_bad=$((desc_bad + 1))
+		echo "     unfixed 64-bit field pattern in $f"
+	fi
+done
+if [[ $desc_seen -gt 0 ]]; then
+	if [[ $desc_bad -eq 0 ]]; then
+		pass "live iBridge descriptors contain no 64-bit fields ($desc_seen checked)"
+	else
+		fail 'live iBridge descriptor still contains 64-bit fields; report_fixup did not run'
+	fi
+else
+	warn 'no iBridge descriptors readable in debugfs; run with sudo'
+fi
+
 bindings=$(find /sys/bus/hid/drivers/apple-ib-touchbar -maxdepth 1 -type l -printf '%f\n' 2>/dev/null | grep -cE '^[0-9A-Fa-f]{4}:' || true)
 [[ $bindings -eq 2 ]] && pass 'both virtual Touch Bar HID devices are bound' || fail "virtual Touch Bar HID binding count is $bindings, expected 2"
 

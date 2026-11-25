@@ -1,0 +1,196 @@
+diff --git a/apple-ib-tb.c b/apple-ib-tb.c
+index bd21c54..2f1a93f 100644
+--- a/apple-ib-tb.c
++++ b/apple-ib-tb.c
+@@ -130,9 +130,17 @@ static const struct attribute_group appletb_attr_group = {
+ 	.attrs = appletb_attrs,
+ };
+ 
++/* bitmask of interfaces that have resumed since the last suspend */
++#define APPLETB_RESUMED_MODE	BIT(0)
++#define APPLETB_RESUMED_DISP	BIT(1)
++#define APPLETB_RESUMED_BOTH	(APPLETB_RESUMED_MODE | APPLETB_RESUMED_DISP)
++
+ struct appletb_device {
+ 	bool			active;
+ 	struct device		*log_dev;
++	/* bitmask of APPLETB_RESUMED_*: interfaces resumed since the last
++	 * suspend or completed restore */
++	u8			resumed_mask;
+ 
+ 	struct hid_field	*mode_field;
+ 	struct hid_field	*disp_field;
+@@ -1269,6 +1277,8 @@ static int appletb_suspend(struct hid_device *hdev, pm_message_t message)
+ 
+ 	spin_lock_irqsave(&tb_dev->tb_lock, flags);
+ 
++	/* re-arm the resume-completion tracking (see appletb_reset_resume) */
++	tb_dev->resumed_mask = 0;
+ 	tb_dev->cur_tb_mode = APPLETB_CMD_MODE_OFF;
+ 	tb_dev->cur_tb_disp = APPLETB_CMD_DISP_OFF;
+ 
+@@ -1284,6 +1294,7 @@ static int appletb_reset_resume(struct hid_device *hdev)
+ 	struct appletb_device *tb_dev = hid_get_drvdata(hdev);
+ 	struct appletb_iface_info *iface_info;
+ 	unsigned long flags;
++	bool print_resumed = false;
+ 
+ 	spin_lock_irqsave(&tb_dev->tb_lock, flags);
+ 
+@@ -1291,23 +1302,47 @@ static int appletb_reset_resume(struct hid_device *hdev)
+ 	if (iface_info)
+ 		iface_info->suspended = false;
+ 
+-	if ((tb_dev->mode_iface.hdev && !tb_dev->mode_iface.suspended) &&
+-	    (tb_dev->disp_iface.hdev && !tb_dev->disp_iface.suspended)) {
+-		/*
+-		 * Restore touch bar state. Note that autopm state is not
+-		 * preserved, so need explicitly restore that here.
+-		 */
+-		tb_dev->active = true;
+-		tb_dev->restore_autopm = true;
+-		tb_dev->last_event_time = ktime_get();
++	/*
++	 * Restore the touch bar state once, when both interfaces have
++	 * resumed. This callback services both .resume and .reset_resume,
++	 * and is invoked once for each of the two underlying USB interfaces
++	 * (mode and display), but the iface_info->suspended flags cannot be
++	 * used to detect completion: when the iBridge is already
++	 * runtime-suspended when the system suspends (the common case when
++	 * the touch bar has been idle), the PM core skips the
++	 * system-suspend callbacks, so both flags are already false when the
++	 * first resume callback runs and a flags-based condition would fire
++	 * on both callbacks. The resumed_mask bits instead record which
++	 * interfaces have resumed since the last suspend or completed
++	 * restore, so this works regardless of callback order and
++	 * regardless of whether the suspend callbacks ran. Note that autopm
++	 * state is not preserved, so need explicitly restore that here.
++	 */
++	if (iface_info) {
++		tb_dev->resumed_mask |=
++			iface_info == &tb_dev->mode_iface ?
++				APPLETB_RESUMED_MODE : APPLETB_RESUMED_DISP;
+ 
+-		appletb_update_touchbar_no_lock(tb_dev, true);
++		if (tb_dev->mode_iface.hdev && tb_dev->disp_iface.hdev &&
++		    tb_dev->resumed_mask == APPLETB_RESUMED_BOTH) {
++			tb_dev->active = true;
++			tb_dev->restore_autopm = true;
++			tb_dev->last_event_time = ktime_get();
+ 
+-		dev_info(tb_dev->log_dev, "Touchbar resumed.\n");
++			appletb_update_touchbar_no_lock(tb_dev, true);
++
++			/* re-arm for the next suspend/resume cycle */
++			tb_dev->resumed_mask = 0;
++
++			print_resumed = true;
++		}
+ 	}
+ 
+ 	spin_unlock_irqrestore(&tb_dev->tb_lock, flags);
+ 
++	if (print_resumed)
++		dev_info(tb_dev->log_dev, "Touchbar resumed.\n");
++
+ 	return 0;
+ }
+ #endif
+diff --git a/apple-ibridge.c b/apple-ibridge.c
+index 95f8b90..aaae666 100644
+--- a/apple-ibridge.c
++++ b/apple-ibridge.c
+@@ -46,6 +46,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ #include <linux/usb.h>
++#include <linux/version.h>
+ 
+ #define USB_VENDOR_ID_APPLE		0x05ac
+ #define USB_DEVICE_ID_APPLE_IBRIDGE	0x8600
+@@ -112,8 +113,6 @@ static int appleib_forward_int_op(struct hid_device *hdev,
+ 			if (rc)
+ 				break;
+ 		}
+-
+-		break;
+ 	}
+ 
+ 	return rc;
+@@ -382,9 +381,11 @@ static struct appleib_hid_dev_info *appleib_add_device(struct hid_device *hdev)
+ 			appleib_add_sub_dev(hdev_info, &appleib_sub_hid_ids[i]);
+ 
+ 		if (IS_ERR(hdev_info->sub_hdevs[i])) {
++			int rc = PTR_ERR(hdev_info->sub_hdevs[i]);
++
+ 			while (i-- > 0)
+ 				hid_destroy_device(hdev_info->sub_hdevs[i]);
+-			return (void *)hdev_info->sub_hdevs[i];
++			return ERR_PTR(rc);
+ 		}
+ 	}
+ 
+@@ -454,11 +455,63 @@ static const struct hid_device_id appleib_hid_ids[] = {
+ 	{ },
+ };
+ 
++/*
++ * Some fields have a size of 64 bits, which according to HID 1.11 Section 8.4
++ * is not valid ("An item field cannot span more than 4 bytes in a report").
++ * Furthermore, hid_field_extract() complains when encountering such a field.
++ * So turn them into two 32-bit fields instead.
++ *
++ * This function was dropped in the rewrite this upstream fork is based on;
++ * it is restored from the original driver (roadrunner2/macbook12-spi-driver,
++ * touchbar-driver-hid-driver branch), with the return type adapted to the
++ * kernel: struct hid_driver.report_fixup became const-qualified in 6.12.
++ */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++static const __u8 *appleib_report_fixup(struct hid_device *hdev, __u8 *rdesc,
++				       unsigned int *rsize)
++#else
++static __u8 *appleib_report_fixup(struct hid_device *hdev, __u8 *rdesc,
++				 unsigned int *rsize)
++#endif
++{
++
++	if (*rsize == 634 &&
++	    /* Usage Page 0xff12 (vendor defined) */
++	    rdesc[212] == 0x06 && rdesc[213] == 0x12 && rdesc[214] == 0xff &&
++	    /* Usage 0x51 */
++	    rdesc[416] == 0x09 && rdesc[417] == 0x51 &&
++	    /* report size 64 */
++	    rdesc[432] == 0x75 && rdesc[433] == 64 &&
++	    /* report count 1 */
++	    rdesc[434] == 0x95 && rdesc[435] == 1) {
++		rdesc[433] = 32;
++		rdesc[435] = 2;
++		hid_dbg(hdev, "Fixed up first 64-bit field\n");
++	}
++
++	if (*rsize == 634 &&
++	    /* Usage Page 0xff12 (vendor defined) */
++	    rdesc[212] == 0x06 && rdesc[213] == 0x12 && rdesc[214] == 0xff &&
++	    /* Usage 0x51 */
++	    rdesc[611] == 0x09 && rdesc[612] == 0x51 &&
++	    /* report size 64 */
++	    rdesc[627] == 0x75 && rdesc[628] == 64 &&
++	    /* report count 1 */
++	    rdesc[629] == 0x95 && rdesc[630] == 1) {
++		rdesc[628] = 32;
++		rdesc[630] = 2;
++		hid_dbg(hdev, "Fixed up second 64-bit field\n");
++	}
++
++	return rdesc;
++}
++
+ static struct hid_driver appleib_hid_driver = {
+ 	.name = "apple-ibridge-hid",
+ 	.id_table = appleib_hid_ids,
+ 	.probe = appleib_hid_probe,
+ 	.remove = appleib_hid_remove,
++	.report_fixup = appleib_report_fixup,
+ 	.raw_event = appleib_hid_raw_event,
+ #ifdef CONFIG_PM
+ 	.suspend = appleib_hid_suspend,
